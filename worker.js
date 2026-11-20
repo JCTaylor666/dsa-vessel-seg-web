@@ -1,7 +1,7 @@
-// worker.js — loads the ONNX fold models and runs nnU-Net-style sliding-window inference off the main thread.
+// worker.js — model loading, file decoding / preprocessing, nnU-Net-style inference and PNG encoding,
+// all off the main thread. The page sends one input file at a time and writes the PNGs this worker returns.
 //
-// The steps mirror nnU-Net v2's predictor for this 2D model, so the browser result matches the cluster
-// pipeline:
+// Inference mirrors nnU-Net v2's predictor for this 2D model:
 //   1. crop to the bounding box of non-zero pixels       (nnunetv2 crop_to_nonzero)
 //   2. z-score over the cropped image                    (ZScoreNormalization, use_mask_for_norm = False)
 //   3. pad to at least the patch size, split evenly      (acvl_utils pad_nd_image, value 0)
@@ -9,6 +9,16 @@
 //   5. logits averaged over the selected folds and, optionally, the 4 mirror flips (nnU-Net averages logits)
 //   6. softmax -> vessel probability; argmax = probability > 0.5; pasted back into the bounding box
 import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/ort.webgpu.min.mjs';
+
+// Same release tag as the page, so a cached old module is never mixed with a new one. These are loaded without
+// top-level await: a message that arrives while a module worker is still awaiting is dropped, so the handler at
+// the bottom is installed right away and waits for libsReady itself.
+const V = new URL(self.location.href).searchParams.get('v') || '0';
+let decodeDicom, windowTo8bit, minOverFrames, positiveBox, cropGray, encodeGrayPng;
+const libsReady = Promise.all([import(`./dicom.js?v=${V}`), import(`./png.js?v=${V}`)]).then(([d, p]) => {
+  ({ decodeDicom, windowTo8bit, minOverFrames, positiveBox, cropGray } = d);
+  ({ encodeGrayPng } = p);
+});
 
 ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/';
 // Threads need cross-origin isolation (COOP/COEP headers), which GitHub Pages does not send.
@@ -18,8 +28,11 @@ const CACHE = 'dsa-vessel-seg-models-v1';
 const sessions = new Map();     // model key -> { session, input, output }
 let ep = null;                  // execution provider chosen for the first session; every later one uses it
 let PH = 896, PW = 768;
+let cancelled = false;
 
 const post = (msg, transfer) => self.postMessage(msg, transfer || []);
+
+// ---------------------------------------------------------------- models
 
 async function sha256Hex(bytes) {
   const d = await crypto.subtle.digest('SHA-256', bytes);
@@ -108,6 +121,8 @@ async function load({ id, models, patch, prefer }) {
   post({ type: 'ready', id, ep, ms: performance.now() - t0, threads: ort.env.wasm.numThreads, loaded: [...sessions.keys()] });
 }
 
+// ---------------------------------------------------------------- inference
+
 function steps(imageSize, tile, stepFrac = 0.5) {
   const target = tile * stepFrac;
   const n = Math.ceil((imageSize - tile) / target) + 1;
@@ -128,10 +143,8 @@ function gaussian() {
   return gauss;
 }
 
-async function run({ id, gray, w, h, mirror, keys }) {
-  const models = keys.map(k => sessions.get(k));
-  if (!models.length || models.some(m => !m)) throw new Error('Model not loaded yet');
-  const t0 = performance.now();
+// gray: Uint8Array w*h -> vessel probability Uint8Array w*h (0..255, >= 128 = vessel)
+async function segmentGray(gray, w, h, mirror, models, onRun) {
   const prob = new Uint8Array(w * h);
 
   // 1. bounding box of non-zero pixels
@@ -142,7 +155,7 @@ async function run({ id, gray, w, h, mirror, keys }) {
       if (y < y0) y0 = y; if (y > y1) y1 = y; if (x < x0) x0 = x; if (x > x1) x1 = x;
     }
   }
-  if (y1 < 0) { post({ type: 'result', id, prob, w, h, ms: 0, runs: 0 }, [prob.buffer]); return; }
+  if (y1 < 0) return prob;
   const ch = y1 - y0 + 1, cw = x1 - x0 + 1, n = ch * cw;
 
   // 2. z-score over the crop
@@ -176,6 +189,7 @@ async function run({ id, gray, w, h, mirror, keys }) {
         else tile.set(img.subarray(src, src + PW), dst);
       }
       for (const m of models) {
+        if (cancelled) throw new Error('cancelled');
         const out = await m.session.run({ [m.input]: new ort.Tensor('float32', tile, [1, 1, PH, PW]) });
         const L = out[m.output].data;               // [1, 2, PH, PW]: background, vessel
         for (let y = 0; y < PH; y++) {
@@ -186,8 +200,7 @@ async function run({ id, gray, w, h, mirror, keys }) {
           }
         }
         if (out[m.output].dispose) out[m.output].dispose();
-        done++;
-        post({ type: 'tile', id, done, total, ms: performance.now() - t0 });
+        onRun(++done, total);
       }
     }
     const k = 1 / (flips.length * models.length);
@@ -207,15 +220,93 @@ async function run({ id, gray, w, h, mirror, keys }) {
       prob[dst + x] = d > 0 ? Math.max(128, p) : Math.min(127, p);
     }
   }
-  post({ type: 'result', id, prob, w, h, ms: performance.now() - t0, runs: total }, [prob.buffer]);
+  return prob;
+}
+
+// ---------------------------------------------------------------- input files
+
+async function bitmapToGray(bitmap) {
+  const w = bitmap.width, h = bitmap.height;
+  const c = new OffscreenCanvas(w, h), ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  const rgba = ctx.getImageData(0, 0, w, h).data, gray = new Uint8Array(w * h);
+  let colour = false;
+  for (let i = 0, j = 0; i < gray.length; i++, j += 4) {
+    if (rgba[j] !== rgba[j + 1] || rgba[j + 1] !== rgba[j + 2]) colour = true;
+    gray[i] = rgba[j];
+  }
+  if (colour) {   // PIL "L" conversion: ITU-R 601-2 luma
+    for (let i = 0, j = 0; i < gray.length; i++, j += 4) gray[i] = Math.round((rgba[j] * 299 + rgba[j + 1] * 587 + rgba[j + 2] * 114) / 1000);
+  }
+  return { gray, w, h, colour };
+}
+
+const decodeOpts = {
+  // JPEG Baseline frames (not used by the Zurich data) are decoded by the browser's own JPEG decoder.
+  jpegBaselineDecode: async (bytes) => (await bitmapToGray(await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }), { colorSpaceConversion: 'none' }))).gray,
+};
+
+// One input file -> list of 8-bit images to segment, all the same size, plus a description for the log.
+async function prepare(file, kind, crop, withMinip) {
+  if (kind === 'png') {
+    const bmp = await createImageBitmap(file, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+    const { gray, w, h, colour } = await bitmapToGray(bmp);
+    const box = crop ? positiveBox(gray, w, h) : null;
+    const img = box ? cropGray(gray, w, box) : gray;
+    const ow = box ? box[3] - box[2] : w, oh = box ? box[1] - box[0] : h;
+    return { w: ow, h: oh, srcW: w, srcH: h, box, note: colour ? 'colour PNG converted to gray' : '', items: [{ name: 'f_1', gray: img }] };
+  }
+  const d = await decodeDicom(await file.arrayBuffer(), decodeOpts);
+  const W = d.cols, H = d.rows;
+  const grays = d.frames.map(f => windowTo8bit(f, d.wc, d.ww));
+  const minip = windowTo8bit(minOverFrames(d.frames), d.wc, d.ww);
+  d.frames.length = 0;                                   // raw pixels no longer needed
+  // one crop box per DICOM: the box of its MinIP, i.e. of the pixels that are > 0 in every frame
+  const box = crop ? positiveBox(minip, W, H) : null;
+  const cut = g => (box ? cropGray(g, W, box) : g);
+  const items = grays.map((g, i) => ({ name: `f_${i + 1}`, gray: cut(g) }));
+  if (withMinip && grays.length > 1) items.push({ name: 'minip', gray: cut(minip) });
+  const missing = d.info.nFramesHeader - grays.length;
+  return {
+    w: box ? box[3] - box[2] : W, h: box ? box[1] - box[0] : H, srcW: W, srcH: H, box,
+    note: `${d.tsName}${missing > 0 ? ` · ${missing} unreadable frame${missing > 1 ? 's' : ''} at the end skipped` : ''}`,
+    items,
+  };
+}
+
+async function processFile({ id, file, kind, crop, minip, mirror, keys }) {
+  cancelled = false;
+  const models = keys.map(k => sessions.get(k));
+  if (!models.length || models.some(m => !m)) throw new Error('Model not loaded yet');
+  const t0 = performance.now();
+  const p = await prepare(file, kind, crop, minip);
+  post({ type: 'fileinfo', id, count: p.items.length, w: p.w, h: p.h, srcW: p.srcW, srcH: p.srcH, box: p.box, note: p.note });
+  for (let i = 0; i < p.items.length; i++) {
+    const it = p.items[i];
+    const prob = await segmentGray(it.gray, p.w, p.h, mirror, models,
+      (done, total) => post({ type: 'run', id, index: i, count: p.items.length, done, total }));
+    const mask = new Uint8Array(prob.length);
+    let fg = 0;
+    for (let k = 0; k < prob.length; k++) if (prob[k] >= 128) { mask[k] = 255; fg++; }
+    const imagePng = await encodeGrayPng(it.gray, p.w, p.h);
+    const maskPng = await encodeGrayPng(mask, p.w, p.h);
+    post({ type: 'frame', id, name: it.name, index: i, count: p.items.length, w: p.w, h: p.h, fg, imagePng, maskPng, gray: it.gray, prob },
+      [imagePng.buffer, maskPng.buffer, it.gray.buffer, prob.buffer]);
+    p.items[i] = null;
+  }
+  post({ type: 'done', id, ms: performance.now() - t0 });
 }
 
 self.onmessage = async (e) => {
   const m = e.data;
+  if (m.type === 'cancel') { cancelled = true; return; }
   try {
+    await libsReady;
     if (m.type === 'load') await load(m);
-    else if (m.type === 'run') await run(m);
+    else if (m.type === 'process') await processFile(m);
   } catch (err) {
-    post({ type: 'error', id: m.id, message: (err && err.message) || String(err) });
+    const msg = (err && err.message) || String(err);
+    post({ type: msg === 'cancelled' ? 'cancelled' : 'error', id: m.id, message: msg });
   }
 };

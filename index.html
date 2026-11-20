@@ -4,34 +4,40 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DSA Vessel Segmentation</title>
-  <meta name="description" content="Segment cerebral vessels in DSA frames with an nnU-Net model that runs entirely in your browser (WebGPU / WebAssembly).">
+  <meta name="description" content="Batch-segment cerebral vessels in DSA DICOM and PNG files with an nnU-Net model that runs entirely in your browser (WebGPU / WebAssembly).">
   <!-- Bump ?v= on both assets with every release: GitHub Pages lets browsers cache files for 10 minutes, and a
        new index.html with an old app.js breaks the page. app.js passes the same version on to worker.js. -->
-  <link rel="stylesheet" href="./style.css?v=4">
+  <link rel="stylesheet" href="./style.css?v=5">
 </head>
 <body>
   <header class="top">
     <div>
       <h1>DSA Vessel Segmentation</h1>
-      <p class="sub">nnU-Net 2D vessel model, running in this browser. Your image never leaves this device.</p>
+      <p class="sub">Batch vessel segmentation of DICOM and PNG files, running in this browser. Nothing is uploaded.</p>
     </div>
     <div class="model" id="modelInfo">Loading model info…</div>
   </header>
 
   <main class="layout">
     <aside class="panel">
+      <p class="meta err" id="unsupported" hidden>This page needs folder access, which only Chrome and Edge (desktop) provide. Please open it there.</p>
+
       <section>
-        <h2>1 · Image</h2>
-        <label class="drop" id="drop" tabindex="0">
-          <input type="file" id="file" accept="image/png,image/jpeg,image/bmp,image/webp" hidden>
-          <span class="drop-main">Choose a DSA frame</span>
-          <span class="drop-hint">PNG / JPG, 8-bit grayscale · or drop / paste it here</span>
-        </label>
-        <p class="meta" id="imgInfo">No image loaded.</p>
+        <h2>1 · Input folder</h2>
+        <button id="openFolder">Open folder…</button>
+        <p class="meta" id="inputInfo">Pick a folder; DICOM (.dcm) and PNG files in it and its subfolders are found automatically.</p>
+        <ol class="files" id="fileList" hidden></ol>
       </section>
 
       <section>
-        <h2>2 · Run</h2>
+        <h2>2 · Preprocess</h2>
+        <label class="check"><input type="checkbox" id="crop" checked> Remove black border</label>
+        <p class="meta tight">Crops to the area of non-zero pixels, as the pipeline's <code>crop_black_border</code> does. A DICOM is cropped with one box for all its frames (the box of its MinIP), so its frames keep one size. Off: images are used as they are.</p>
+        <label class="check"><input type="checkbox" id="minip"> Also save each DICOM's MinIP (and its mask)</label>
+      </section>
+
+      <section>
+        <h2>3 · Model</h2>
         <div class="row">
           <label for="backend">Backend</label>
           <select id="backend">
@@ -46,13 +52,22 @@
         </div>
         <p class="meta tight" id="foldInfo"></p>
         <label class="check"><input type="checkbox" id="mirror"> Mirroring TTA <span class="muted">(nnU-Net default, 4× slower)</span></label>
-        <button class="primary" id="run" disabled>Segment</button>
-        <div class="progress" id="progressWrap" hidden><div class="bar" id="bar"></div></div>
-        <p class="meta" id="status" role="status" aria-live="polite">Pick an image to start. The model downloads on the first run and is cached afterwards.</p>
       </section>
 
       <section>
-        <h2>3 · View &amp; export</h2>
+        <h2>4 · Run</h2>
+        <p class="meta tight" id="outInfo">Results go into a new folder inside the input folder.</p>
+        <div class="row buttons">
+          <button id="chooseOut" disabled>Save results elsewhere…</button>
+        </div>
+        <button class="primary" id="run" disabled>Segment all</button>
+        <button id="cancel" hidden>Stop</button>
+        <div class="progress" id="progressWrap" hidden><div class="bar" id="bar"></div></div>
+        <p class="meta" id="status" role="status" aria-live="polite">Open a folder to start. The model downloads on the first run and is cached afterwards.</p>
+      </section>
+
+      <section>
+        <h2>5 · Preview</h2>
         <div class="seg" role="radiogroup" aria-label="Display">
           <label><input type="radio" name="mode" value="overlay" checked> Overlay</label>
           <label><input type="radio" name="mode" value="mask"> Mask</label>
@@ -63,33 +78,27 @@
           <label for="opacity">Overlay opacity</label>
           <input type="range" id="opacity" min="0" max="100" value="55">
         </div>
-        <div class="row buttons">
-          <button id="dlMask" disabled>Mask PNG</button>
-          <button id="dlProb" disabled>Probability PNG</button>
-        </div>
-        <p class="meta" id="result"></p>
+        <p class="meta" id="previewInfo"></p>
       </section>
 
       <section>
-        <h2>4 · Downloaded models</h2>
+        <h2>6 · Downloaded models</h2>
         <p class="meta tight" id="cacheInfo">Checking this browser's storage…</p>
         <button id="clearCache" class="danger" disabled>Delete downloaded models</button>
       </section>
 
       <footer class="foot">
         <p>Model: nnU-Net v2 <code>PlainConvUNet</code> (46 M parameters per fold). Selected folds are averaged the way nnU-Net does it (mean of the logits). Research use only — not a medical device.</p>
-        <p><a href="https://github.com/JCTaylor666/dsa-vessel-seg-web">Source</a> · <a id="weightsLink" href="https://github.com/JCTaylor666/dsa-vessel-seg-weights">Weights</a></p>
+        <p><a href="https://github.com/JCTaylor666/dsa-vessel-seg-web">Source</a> · <a id="weightsLink" href="https://huggingface.co/cjy666/dsa-vessel-seg">Weights</a></p>
       </footer>
     </aside>
 
     <section class="stage" id="stage">
-      <div class="empty" id="empty">
-        <p>Drop a DSA frame anywhere on this page.</p>
-      </div>
+      <div class="empty" id="empty"><p>The frame being segmented is shown here.</p></div>
       <canvas id="view" hidden></canvas>
     </section>
   </main>
 
-  <script type="module" src="./app.js?v=4"></script>
+  <script type="module" src="./app.js?v=5"></script>
 </body>
 </html>
