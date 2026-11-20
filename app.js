@@ -13,7 +13,10 @@ const el = {
   progressWrap: $('progressWrap'), bar: $('bar'), status: $('status'), opacity: $('opacity'),
   dlMask: $('dlMask'), dlProb: $('dlProb'), result: $('result'),
   stage: $('stage'), empty: $('empty'), view: $('view'), weightsLink: $('weightsLink'),
+  cacheInfo: $('cacheInfo'), clearCache: $('clearCache'),
 };
+const MODEL_CACHE = /^dsa-vessel-seg-models/;   // every cache name the worker has ever used
+let cacheState = { files: 0, bytes: 0 }, disarmTimer = 0;
 
 let manifest = null;          // model.json from the weights repo
 let worker = null, workerBackend = null, loadedKeys = new Set(), runtimeLabel = '';
@@ -41,6 +44,7 @@ function refreshButtons() {
   el.run.disabled = busy || !image || !manifest || selectedFolds().length === 0;
   el.dlMask.disabled = el.dlProb.disabled = busy || !prob;
   el.folds.querySelectorAll('input').forEach((i) => { i.disabled = busy; });
+  el.clearCache.disabled = busy || !cacheState.files;
 }
 function refreshFoldInfo() {
   if (!manifest) return;
@@ -146,6 +150,78 @@ async function segment() {
     setStatus(e.message, true); setProgress(null);
   } finally {
     busy = false; refreshButtons();
+    refreshCacheInfo();
+  }
+}
+
+// ---------- downloaded-model storage ----------
+// The worker keeps each downloaded fold in the Cache API (per browser, per site). This section shows what is
+// stored and deletes it on request; nothing else on the page writes to browser storage.
+
+async function cacheSummary() {
+  if (!('caches' in self)) return null;
+  let files = 0, bytes = 0;
+  for (const name of await caches.keys()) {
+    if (!MODEL_CACHE.test(name)) continue;
+    const cache = await caches.open(name);
+    for (const req of await cache.keys()) {
+      const res = await cache.match(req);
+      if (!res) continue;
+      files++;
+      bytes += Number(res.headers.get('x-model-bytes')) || (await res.blob()).size;
+    }
+  }
+  return { files, bytes };
+}
+
+async function refreshCacheInfo() {
+  try {
+    const s = await cacheSummary();
+    if (!s) {
+      cacheState = { files: 0, bytes: 0 };
+      el.cacheInfo.textContent = 'This browser has no cache storage, so models are not kept between visits.';
+    } else {
+      cacheState = s;
+      el.cacheInfo.textContent = s.files
+        ? `${s.files} model file${s.files > 1 ? 's' : ''} stored in this browser · ${fmtMB(s.bytes)}`
+        : 'No model files stored in this browser.';
+    }
+  } catch (e) {
+    el.cacheInfo.textContent = `Could not read this browser's storage (${e.message}).`;
+  }
+  refreshButtons();
+}
+
+function disarmClear() {
+  clearTimeout(disarmTimer);
+  el.clearCache.classList.remove('armed');
+  el.clearCache.textContent = 'Delete downloaded models';
+}
+
+async function clearCache() {
+  if (busy || !cacheState.files) return;
+  if (!el.clearCache.classList.contains('armed')) {   // first click only arms the button
+    el.clearCache.classList.add('armed');
+    el.clearCache.textContent = `Click again to delete ${fmtMB(cacheState.bytes)}`;
+    disarmTimer = setTimeout(disarmClear, 5000);
+    return;
+  }
+  disarmClear();
+  busy = true; refreshButtons();
+  try {
+    const before = await cacheSummary();
+    for (const name of await caches.keys()) if (MODEL_CACHE.test(name)) await caches.delete(name);
+    // the models loaded in memory go too, so the next run really downloads again
+    if (worker) { worker.terminate(); worker = null; workerBackend = null; }
+    loadedKeys = new Set();
+    el.modelInfo.textContent = manifest ? `${manifest.name} · ${manifest.folds.length} folds · ${manifest.patch[0]}×${manifest.patch[1]} patches` : el.modelInfo.textContent;
+    setStatus(`Deleted ${before.files} model file${before.files === 1 ? '' : 's'} (${fmtMB(before.bytes)}). The next run downloads them again.`);
+  } catch (e) {
+    setStatus(`Could not delete the stored models (${e.message}).`, true);
+  } finally {
+    busy = false;
+    refreshFoldInfo();
+    await refreshCacheInfo();
   }
 }
 
@@ -240,9 +316,12 @@ el.opacity.addEventListener('input', draw);
 document.querySelectorAll('input[name=mode]').forEach((r) => r.addEventListener('change', draw));
 el.dlMask.addEventListener('click', () => downloadPng('mask'));
 el.dlProb.addEventListener('click', () => downloadPng('prob'));
+el.clearCache.addEventListener('click', clearCache);
+el.clearCache.addEventListener('blur', disarmClear);
 
 // Small hook for automated checks: window.__vesselSeg.loadBlob(blob) / .segment() / .getProb()
 window.__vesselSeg = { loadBlob, segment, getProb: () => prob, isBusy: () => busy };
 
 if (!('gpu' in navigator)) el.backend.querySelector('option[value=webgpu]').disabled = true;
 loadManifest();
+refreshCacheInfo();

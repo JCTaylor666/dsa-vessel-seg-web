@@ -16,6 +16,9 @@ inside your web browser. No server, no install, and the image never leaves your 
 4. **Segment.** The first run downloads the selected folds (~185 MB each) and keeps them in the browser
    cache; later runs start immediately.
 5. View the overlay, mask or probability map and download them as PNG.
+6. To free the disk space again, use **Delete downloaded models** (section 4). It shows how many model files
+   this browser holds and how big they are, and removes them after a second click. Clearing the site's data
+   in the browser settings does the same.
 
 Typical time for one 791 × 1022 frame on an Apple-silicon laptop:
 

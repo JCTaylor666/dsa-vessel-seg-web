@@ -80,6 +80,8 @@ button {
 }
 button:hover:not(:disabled) { border-color: var(--accent); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.danger { margin-top: 8px; }
+button.danger:hover:not(:disabled), button.danger.armed { border-color: var(--danger); color: var(--danger); }
 button.primary { width: 100%; margin-top: 8px; background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
 
 .progress { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 10px; }

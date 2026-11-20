@@ -57,7 +57,10 @@ async function fetchModel(m, report) {
     const got = await sha256Hex(bytes);
     if (got !== m.sha256) throw new Error(`Checksum mismatch for ${m.key} (got ${got.slice(0, 12)}…, expected ${m.sha256.slice(0, 12)}…)`);
   }
-  if (cache) { try { await cache.put(m.url, new Response(bytes, { headers: { 'content-type': 'application/octet-stream' } })); } catch (e) { /* quota: just don't cache */ } }
+  if (cache) {
+    try { await cache.put(m.url, new Response(bytes, { headers: { 'content-type': 'application/octet-stream', 'x-model-bytes': String(bytes.byteLength) } })); }
+    catch (e) { /* quota: just don't cache */ }
+  }
   return bytes;
 }
 
