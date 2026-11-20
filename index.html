@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DSA Vessel Segmentation</title>
   <meta name="description" content="Segment cerebral vessels in DSA frames with an nnU-Net model that runs entirely in your browser (WebGPU / WebAssembly).">
-  <link rel="stylesheet" href="./style.css">
+  <!-- Bump ?v= on both assets with every release: GitHub Pages lets browsers cache files for 10 minutes, and a
+       new index.html with an old app.js breaks the page. app.js passes the same version on to worker.js. -->
+  <link rel="stylesheet" href="./style.css?v=4">
 </head>
 <body>
   <header class="top">
@@ -88,6 +90,6 @@
     </section>
   </main>
 
-  <script type="module" src="./app.js"></script>
+  <script type="module" src="./app.js?v=4"></script>
 </body>
 </html>

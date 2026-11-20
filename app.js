@@ -85,7 +85,8 @@ function ensureWorker() {
   if (worker && workerBackend === backend) return;
   if (worker) worker.terminate();
   loadedKeys = new Set();
-  worker = new Worker('./worker.js', { type: 'module' });
+  const v = new URL(import.meta.url).searchParams.get('v');   // same release tag as app.js (see index.html)
+  worker = new Worker('./worker.js' + (v ? '?v=' + encodeURIComponent(v) : ''), { type: 'module' });
   workerBackend = backend;
   worker.onmessage = (e) => {
     const m = e.data, w = waiting.get(m.id);
